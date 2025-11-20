@@ -1,0 +1,8 @@
+# Don't let notebooks dominate language stats
+*.ipynb linguist-weight=0
+
+# Treat model & binary files as Python-related
+*.pb linguist-language=Python
+*.pkl linguist-language=Python
+*.h5 linguist-language=Python
+*.keras linguist-language=Python
