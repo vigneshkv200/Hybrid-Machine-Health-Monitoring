@@ -19,17 +19,17 @@ st.title("🛠️ Hybrid Machine Health Monitoring Dashboard")
 # ---------------------------------------
 # LOAD MODELS
 # ---------------------------------------
-autoencoder = tf.keras.models.load_model("../models/autoencoder_model")
-lstm_rul = tf.keras.models.load_model("../models/lstm_rul_model")
+autoencoder = tf.keras.models.load_model("Advanced_Hybrid_ML_Project/models/autoencoder_model")
+lstm_rul = tf.keras.models.load_model("Advanced_Hybrid_ML_Project/models/lstm_rul_model")
 
-with open("../models/fusion_model.pkl", "rb") as f:
+with open("Advanced_Hybrid_ML_Project/models/fusion_model.pkl", "rb") as f:
     fusion_model = pickle.load(f)
 
-with open("../models/scaler.pkl", "rb") as f:
+with open("Advanced_Hybrid_ML_Project/models/scaler.pkl", "rb") as f:
     scaler = pickle.load(f)
 
 # Load dashboard dataset
-dashboard_df = pd.read_csv("../data/raw/dashboard_dataset.csv")
+dashboard_df = pd.read_csv("Advanced_Hybrid_ML_Project/data/raw/dashboard_dataset.csv")
 
 # ---------------------------------------
 # FUNCTIONS
@@ -166,3 +166,4 @@ with tab2:
             plot_series(failure_prob_user, "Failure Probability (Uploaded Data)", color="red")
             plot_series(anomaly_scores, "Anomaly Score (Uploaded Data)", color="orange")
             plot_series(rul_pred, "RUL Prediction (Uploaded Data)", color="purple")
+
