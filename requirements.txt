@@ -1,0 +1,9 @@
+tensorflow==2.12.0
+numpy==1.23.5
+pandas
+scikit-learn
+joblib
+streamlit
+matplotlib
+protobuf==4.25.0
+tensorflow-io-gcs-filesystem
