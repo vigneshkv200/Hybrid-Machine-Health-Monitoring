@@ -1,4 +1,4 @@
-# app.py — Final production-ready (copy entire file)
+# app.py — FULL FIXED (drop-in replacement)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,28 +10,28 @@ from pathlib import Path
 # -----------------------------
 # Page config
 # -----------------------------
-st.set_page_config(
-    page_title="Hybrid ML Machine Health Dashboard",
-    layout="wide",
-    page_icon="🛠️"
-)
+st.set_page_config(page_title="Hybrid ML Machine Health Dashboard",
+                   layout="wide", page_icon="🛠️")
 st.title("🛠️ Hybrid Machine Health Monitoring Dashboard")
 
 # -----------------------------
-# Paths (adjust if you moved files)
+# Paths
 # -----------------------------
 BASE = Path(".")
-AE_PATH = BASE / "Advanced_Hybrid_ML_Project" / "models" / "autoencoder_model"
-LSTM_PATH = BASE / "Advanced_Hybrid_ML_Project" / "models" / "lstm_rul_model"
-FUSION_MODEL_PATH = BASE / "Advanced_Hybrid_ML_Project" / "models" / "fusion_model_joblib.pkl"
-FUSION_SCALER_PATH = BASE / "Advanced_Hybrid_ML_Project" / "models" / "fusion_feature_scaler_joblib.pkl"
-GLOBAL_MINMAX_PATH = BASE / "Advanced_Hybrid_ML_Project" / "models" / "global_minmax_joblib.pkl"
+MODELS_DIR = BASE / "Advanced_Hybrid_ML_Project" / "models"
+AE_PATH = MODELS_DIR / "autoencoder_model"
+LSTM_PATH = MODELS_DIR / "lstm_rul_model"
+FUSION_MODEL_PATH = MODELS_DIR / "fusion_model_joblib.pkl"
+FUSION_SCALER_PATH = MODELS_DIR / "fusion_feature_scaler_joblib.pkl"
+GLOBAL_MINMAX_PATH = MODELS_DIR / "global_minmax_joblib.pkl"
+ANOMALY_STATS_PATH = MODELS_DIR / "anomaly_stats_joblib.pkl"   # optional (min/max or mean/std saved during training)
 DASHBOARD_CSV = BASE / "Advanced_Hybrid_ML_Project" / "data" / "raw" / "dashboard_dataset.csv"
 
-WINDOW = 100  # window size used in training
+WINDOW = 100
+MAX_RUL = 9900  # training used 9900
 
 # -----------------------------
-# Small helpers
+# Helpers
 # -----------------------------
 def st_error_and_stop(msg):
     st.error(msg)
@@ -45,18 +45,10 @@ def plot_series(y, title, color="blue"):
     st.pyplot(fig)
 
 def colored_badge(text, color):
-    return f"""
-    <span style="background-color:{color};
-                 padding:6px 12px;
-                 border-radius:10px;
-                 color:white;
-                 font-weight:700;">
-        {text}
-    </span>
-    """
+    return f"""<span style="background-color:{color}; padding:6px 12px; border-radius:10px; color:white; font-weight:700;">{text}</span>"""
 
 # -----------------------------
-# Load models (robust)
+# Load models & artifacts
 # -----------------------------
 st.sidebar.info("Loading models...")
 
@@ -70,14 +62,15 @@ try:
     fusion_model = joblib.load(str(FUSION_MODEL_PATH))
     fusion_scaler = joblib.load(str(FUSION_SCALER_PATH))
 except Exception as e:
-    st_error_and_stop(f"Failed to load fusion joblib artifacts: {e}")
+    st_error_and_stop(f"Failed to load fusion artifacts: {e}")
 
-# global min/max may be tuple (Xmin, Xmax) or dict
+# global min/max (for raw sensor scaling)
 try:
     gm = joblib.load(str(GLOBAL_MINMAX_PATH))
-    if isinstance(gm, (tuple, list)):
+    if isinstance(gm, (list, tuple)):
         Xmin, Xmax = np.array(gm[0], dtype=float), np.array(gm[1], dtype=float)
     elif isinstance(gm, dict):
+        # accept 'min'/'max' or 'Xmin'/'Xmax'
         if "min" in gm and "max" in gm:
             Xmin, Xmax = np.array(gm["min"], dtype=float), np.array(gm["max"], dtype=float)
         elif "Xmin" in gm and "Xmax" in gm:
@@ -85,14 +78,22 @@ try:
         else:
             raise ValueError("global_minmax dict missing expected keys")
     else:
-        raise ValueError("global_minmax has unexpected type")
+        raise ValueError("global_minmax has unexpected format")
 except Exception as e:
-    st_error_and_stop(f"Failed to load global min/max: {e}")
+    st_error_and_stop(f"Failed to load global_minmax: {e}")
 
-st.sidebar.success("Models loaded")
+# optional: anomaly stats saved during training (min/max or mean/std)
+anomaly_stats = None
+if ANOMALY_STATS_PATH.exists():
+    try:
+        anomaly_stats = joblib.load(str(ANOMALY_STATS_PATH))
+    except Exception:
+        anomaly_stats = None
+
+st.sidebar.success("Models & artifacts loaded")
 
 # -----------------------------
-# Load dashboard dataset (optional)
+# Load dashboard dataset if present (used as fallback)
 # -----------------------------
 if DASHBOARD_CSV.exists():
     try:
@@ -106,89 +107,67 @@ else:
 # Preprocessing helpers
 # -----------------------------
 def scale_raw_sensors(X_raw: np.ndarray):
-    # elementwise min-max
     denom = (Xmax - Xmin) + 1e-9
     return (X_raw - Xmin) / denom
 
-def create_windows_from_array(X: np.ndarray, window: int = WINDOW):
+def create_windows(X: np.ndarray, window: int = WINDOW):
     n = X.shape[0]
     if n < window:
         pad_count = window - n + 1
         pad = np.repeat(X[-1:].reshape(1, -1), pad_count, axis=0)
         X = np.vstack([X, pad])
         n = X.shape[0]
-    windows = np.stack([X[i:i+window] for i in range(n - window + 1)], axis=0)
-    return windows
+    return np.stack([X[i:i+window] for i in range(n - window + 1)], axis=0)
 
 # -----------------------------
-# UI tabs
+# Tabs UI
 # -----------------------------
 tab1, tab2 = st.tabs(["📊 Dashboard", "📁 Upload & Predict"])
 
-# ---------- TAB 1 ----------
+# Tab 1: Dashboard
 with tab1:
     st.subheader("📊 Machine Health Overview")
     if dashboard_df.empty:
-        st.info("No dashboard dataset available. Use the Upload tab to test.")
+        st.info("No dashboard dataset found. Use Upload tab to test.")
     else:
-        def safe_get(col, default=0.0):
-            return dashboard_df[col].iloc[-1] if col in dashboard_df.columns else default
+        def safe(col, d=0.0):
+            return dashboard_df[col].iloc[-1] if col in dashboard_df.columns else d
+        cur_hi = safe("health_index", 0.0)
+        cur_fp = safe("failure_probability", 0.0)
+        cur_rul = safe("rul_prediction", 0.0)
 
-        current_health = safe_get("health_index", 0.0)
-        current_fp = safe_get("failure_probability", 0.0)
-        current_rul = safe_get("rul_prediction", 0.0)
-
-        if current_health > 0.7:
-            status_color, status_text = "green", "HEALTHY"
-        elif current_health > 0.4:
-            status_color, status_text = "orange", "WARNING"
+        if cur_hi > 0.7:
+            st.markdown(colored_badge("HEALTHY", "green"), unsafe_allow_html=True)
+        elif cur_hi > 0.4:
+            st.markdown(colored_badge("WARNING", "orange"), unsafe_allow_html=True)
         else:
-            status_color, status_text = "red", "CRITICAL FAILURE"
-
-        st.markdown(f"<div style='padding:12px;border-radius:10px;background:#f5f5f5;text-align:center;'><h2 style='color:{status_color};'>Machine Status: {status_text}</h2></div>", unsafe_allow_html=True)
+            st.markdown(colored_badge("CRITICAL FAILURE", "red"), unsafe_allow_html=True)
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("Health Index", f"{current_health:.2f}")
-        col2.metric("Failure Probability", f"{current_fp:.2f}")
-        col3.metric("Predicted RUL", f"{current_rul:.0f} steps")
-
+        col1.metric("Health Index", f"{cur_hi:.2f}")
+        col2.metric("Failure Probability", f"{cur_fp:.2f}")
+        col3.metric("Predicted RUL", f"{cur_rul:.0f} steps")
         st.markdown("---")
-        option = st.radio("Select Visualization:", ["Health Index", "Failure Probability", "RUL Prediction", "Anomaly Score", "Raw Sensors"], horizontal=True)
-
-        if option == "Health Index":
-            if "health_index" in dashboard_df.columns:
-                plot_series(dashboard_df["health_index"], "Health Index Over Time", color="green")
-            else:
-                st.info("health_index column not found in dashboard dataset")
-        elif option == "Failure Probability":
-            if "failure_probability" in dashboard_df.columns:
-                plot_series(dashboard_df["failure_probability"], "Failure Probability Over Time", color="red")
-            else:
-                st.info("failure_probability column not found in dashboard dataset")
-        elif option == "RUL Prediction":
-            if "rul_prediction" in dashboard_df.columns:
-                plot_series(dashboard_df["rul_prediction"], "RUL Prediction Over Time", color="purple")
-            else:
-                st.info("rul_prediction column not found in dashboard dataset")
-        elif option == "Anomaly Score":
-            if "anomaly_score" in dashboard_df.columns:
-                plot_series(dashboard_df["anomaly_score"], "Anomaly Score Timeline", color="orange")
-            else:
-                st.info("anomaly_score column not found in dashboard dataset")
+        option = st.radio("Visualization:", ["Health Index", "Failure Probability", "RUL Prediction", "Anomaly Score", "Raw Sensors"], horizontal=True)
+        if option == "Health Index" and "health_index" in dashboard_df:
+            plot_series(dashboard_df["health_index"], "Health Index", color="green")
+        elif option == "Failure Probability" and "failure_probability" in dashboard_df:
+            plot_series(dashboard_df["failure_probability"], "Failure Probability", color="red")
+        elif option == "RUL Prediction" and "rul_prediction" in dashboard_df:
+            plot_series(dashboard_df["rul_prediction"], "RUL Prediction", color="purple")
+        elif option == "Anomaly Score" and "anomaly_score" in dashboard_df:
+            plot_series(dashboard_df["anomaly_score"], "Anomaly Score", color="orange")
         elif option == "Raw Sensors":
-            sensor = st.selectbox("Choose Sensor:", ["vibration","temperature","pressure","torque","current","rpm"])
-            if sensor in dashboard_df.columns:
-                plot_series(dashboard_df[sensor], f"{sensor.capitalize()} Over Time", color="blue")
-            else:
-                st.info(f"{sensor} not found in dashboard dataset")
+            sensor = st.selectbox("Choose sensor:", ["vibration","temperature","pressure","torque","current","rpm"])
+            if sensor in dashboard_df:
+                plot_series(dashboard_df[sensor], f"{sensor} over time", color="blue")
 
-# ---------- TAB 2 ----------
+# Tab 2: Upload & Predict (core fixes)
 with tab2:
     st.subheader("📁 Upload Sensor CSV for Real-Time Prediction")
     uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
-
     if uploaded_file is None:
-        st.info("Upload a sensor CSV with columns: vibration, temperature, pressure, torque, current, rpm")
+        st.info("Upload CSV with columns: vibration,temperature,pressure,torque,current,rpm")
     else:
         try:
             user_df = pd.read_csv(uploaded_file)
@@ -196,42 +175,48 @@ with tab2:
             st_error_and_stop(f"Failed to read uploaded CSV: {e}")
 
         st.write(user_df.head())
-        required_cols = ["vibration","temperature","pressure","torque","current","rpm"]
-        if not set(required_cols).issubset(user_df.columns):
-            st.error("CSV missing required sensor columns")
+        required = ["vibration","temperature","pressure","torque","current","rpm"]
+        if not set(required).issubset(user_df.columns):
+            st.error("CSV missing required columns")
         else:
-            raw = user_df[required_cols].values.astype(float)
-            # scale using training global min/max
+            raw = user_df[required].values.astype(float)
+
+            # 1) Scale raw sensor values using training global min/max (same as training pipeline)
             scaled = scale_raw_sensors(raw)
-            Xw = create_windows_from_array(scaled, WINDOW)
+
+            # 2) Create windows
+            Xw = create_windows(scaled, WINDOW)
             n_windows = Xw.shape[0]
-            # reference train window count if dashboard available
             train_n_windows = (dashboard_df.shape[0] - WINDOW + 1) if not dashboard_df.empty else max(1, n_windows)
 
-            # AE inference
+            # 3) Autoencoder inference -> anomaly scores (raw MSE)
             try:
                 X_rec = autoencoder.predict(Xw, verbose=0)
                 anomaly_scores = np.mean((Xw - X_rec)**2, axis=(1,2))
             except Exception as e:
                 st_error_and_stop(f"Autoencoder inference error: {e}")
 
-            # LSTM RUL inference
+            # 4) LSTM RUL inference -> handle normalized vs absolute
             try:
                 lstm_out = lstm_rul.predict(Xw, verbose=0).flatten()
-                # If model outputs in [0,1], scale to train window count
-                if np.max(lstm_out) <= 1.01:
-                    rul_vals = lstm_out * float(train_n_windows)
+                # If model outputs are normalized (<=1.01), map to MAX_RUL
+                if np.nanmax(lstm_out) <= 1.01:
+                    rul_abs = lstm_out * MAX_RUL
+                    rul_scaled_for_index = lstm_out  # in [0,1]
                 else:
-                    rul_vals = lstm_out.copy()
-                # ensure non-negative
-                rul_vals = np.maximum(rul_vals, 0.0)
+                    # model output is absolute RUL already
+                    rul_abs = lstm_out
+                    rul_scaled_for_index = np.clip(rul_abs / MAX_RUL, 0.0, 1.0)
+                rul_abs = np.maximum(rul_abs, 0.0)
             except Exception as e:
                 st_error_and_stop(f"LSTM inference error: {e}")
 
-            # fusion prediction (use last window)
+            # 5) Prepare fusion features in the same space used during training
             latest_anom = float(anomaly_scores[-1])
-            latest_rul = float(rul_vals[-1])
-            fusion_features = np.array([[latest_anom, latest_rul]], dtype=float)
+            latest_rul_abs = float(rul_abs[-1])
+
+            fusion_features = np.array([[latest_anom, latest_rul_abs]], dtype=float)
+
             try:
                 fusion_scaled = fusion_scaler.transform(fusion_features)
                 if hasattr(fusion_model, "predict_proba"):
@@ -241,48 +226,70 @@ with tab2:
             except Exception as e:
                 st_error_and_stop(f"Fusion inference error: {e}")
 
-            # anomaly boolean: anomaly if latest_anom >> distribution or fusion_prob high
-            # use mean+2*std heuristic on anomaly_scores
+            # 6) Stable anomaly normalization for health index
+            # Preference order for training anomaly stats:
+            #  a) loaded anomaly_stats (if saved during training)
+            #  b) dashboard_df anomaly_score min/max (if available)
+            #  c) fallback to anomaly_scores min/max from current uploaded windows (last resort)
+            an_min = None; an_max = None
+            if anomaly_stats is not None:
+                # anomaly_stats may be dict with 'min'/'max' or 'mean'/'std'
+                if isinstance(anomaly_stats, dict) and "min" in anomaly_stats and "max" in anomaly_stats:
+                    an_min, an_max = float(anomaly_stats["min"]), float(anomaly_stats["max"])
+                elif isinstance(anomaly_stats, dict) and "mean" in anomaly_stats and "std" in anomaly_stats:
+                    # convert to approximate min/max = mean +/- 3*std
+                    an_min = float(anomaly_stats["mean"] - 3.0 * anomaly_stats["std"])
+                    an_max = float(anomaly_stats["mean"] + 3.0 * anomaly_stats["std"])
+            if an_min is None or an_max is None:
+                if "anomaly_score" in dashboard_df.columns:
+                    an_min = float(dashboard_df["anomaly_score"].min())
+                    an_max = float(dashboard_df["anomaly_score"].max())
+            if an_min is None or an_max is None:
+                # fallback to uploaded anomaly window stats (not ideal but safe)
+                an_min = float(np.min(anomaly_scores))
+                an_max = float(np.max(anomaly_scores))
+            # avoid division by zero
+            if (an_max - an_min) < 1e-9:
+                an_norm_latest = 0.0
+            else:
+                an_norm_latest = (latest_anom - an_min) / (an_max - an_min)
+                an_norm_latest = float(np.clip(an_norm_latest, 0.0, 1.0))
+
+            # 7) Health index: combine anomaly (lower better) and normalized RUL (higher better)
+            hi = 0.5 * (1.0 - an_norm_latest) + 0.5 * rul_scaled_for_index[-1] if isinstance(rul_scaled_for_index, np.ndarray) else 0.5 * (1.0 - an_norm_latest) + 0.5 * float(rul_scaled_for_index)
+            hi = float(np.clip(hi, 0.0, 1.0))
+
+            # 8) Anomaly boolean (two-pronged): local z-score + fusion probability
             an_mean = float(np.mean(anomaly_scores))
             an_std = float(np.std(anomaly_scores)) + 1e-9
             is_anomaly_local = latest_anom > (an_mean + 2.0 * an_std)
             is_anomaly_fusion = failure_prob > 0.5
             is_anomaly = bool(is_anomaly_local or is_anomaly_fusion)
 
-            # stable anomaly normalization for health index
-            # use z-score clamp to 0-1
-            an_z = (latest_anom - an_mean) / an_std
-            an_norm = np.clip((an_z + 3) / 6.0, 0.0, 1.0)  # map z in [-3,3] -> [0,1]
-
-            # RUL normalization for health index: normalized by train_n_windows
-            rul_norm = float(np.clip(latest_rul / max(1.0, float(train_n_windows)), 0.0, 1.0))
-
-            # Health index: combine anomaly (lower is better) and RUL (higher is better)
-            health_index = 0.5 * (1.0 - an_norm) + 0.5 * rul_norm
-            health_index = float(np.clip(health_index, 0.0, 1.0))
-
-            # Determine machine status & RUL interpretation
-            if health_index > 0.7:
-                machine_status = "HEALTHY"; status_color = "green"
-            elif health_index > 0.4:
-                machine_status = "WARNING"; status_color = "orange"
+            # 9) Machine status & RUL interpretation
+            if hi > 0.7:
+                machine_status, status_color = "HEALTHY", "green"
+            elif hi > 0.4:
+                machine_status, status_color = "WARNING", "orange"
             else:
-                machine_status = "CRITICAL FAILURE"; status_color = "red"
+                machine_status, status_color = "CRITICAL FAILURE", "red"
 
-            if latest_rul > 3000:
-                rul_state = "Long life remaining"; rul_color = "green"
-            elif latest_rul > 1000:
-                rul_state = "Mid-life (Degrading)"; rul_color = "orange"
+            if latest_rul_abs > 3000:
+                rul_state, rul_color = "Long life remaining", "green"
+            elif latest_rul_abs > 1000:
+                rul_state, rul_color = "Mid-life (Degrading)", "orange"
             else:
-                rul_state = "End-of-Life Soon"; rul_color = "red"
+                rul_state, rul_color = "End-of-Life Soon", "red"
 
-            # Display metrics and badges
+            # -----------------------------
+            # Display results (with proper HTML rendering)
+            # -----------------------------
             st.subheader("🔍 Prediction Results")
             c1, c2, c3 = st.columns(3)
-            c1.metric("Health Index", f"{health_index:.2f}")
+            c1.metric("Health Index", f"{hi:.2f}")
             c1.markdown(colored_badge(
-                "Healthy (0.7–1.0)" if health_index>0.7 else
-                "Warning (0.4–0.7)" if health_index>0.4 else
+                "Healthy (0.7–1.0)" if hi>0.7 else
+                "Warning (0.4–0.7)" if hi>0.4 else
                 "Critical (0–0.4)",
                 status_color
             ), unsafe_allow_html=True)
@@ -295,31 +302,33 @@ with tab2:
                 "green" if failure_prob < 0.3 else "orange" if failure_prob < 0.7 else "red"
             ), unsafe_allow_html=True)
 
-            c3.metric("Predicted RUL", f"{latest_rul:.0f} steps")
+            c3.metric("Predicted RUL", f"{latest_rul_abs:.0f} steps")
             c3.markdown(colored_badge(rul_state, rul_color), unsafe_allow_html=True)
 
             st.markdown("---")
-            st.markdown(f"### ⚠️ Anomaly Detected: {colored_badge('TRUE', 'red') if is_anomaly else colored_badge('FALSE','green')}", unsafe_allow_html=True)
+            st.markdown(f"### ⚠️ Anomaly Detected: {colored_badge('TRUE','red') if is_anomaly else colored_badge('FALSE','green')}", unsafe_allow_html=True)
             st.markdown(f"### 🏭 Machine Status: {colored_badge(machine_status, status_color)}", unsafe_allow_html=True)
             st.markdown(f"### ⏳ RUL Interpretation: {colored_badge(rul_state, rul_color)}", unsafe_allow_html=True)
 
             st.markdown("---")
             # Plots
             plot_series(anomaly_scores, "Anomaly Score (Uploaded Data)", color="orange")
-            plot_series(rul_vals, "RUL Predictions Over Time (Uploaded Data)", color="purple")
-            plot_series([health_index], "Health Index (Uploaded Data)", color="green")
+            plot_series(rul_abs, "RUL Predictions Over Time (Uploaded Data)", color="purple")
+            plot_series([hi], "Health Index (Uploaded Data)", color="green")
             plot_series([failure_prob], "Failure Probability (Uploaded Data)", color="red")
 
-            # small debug info (optional)
-            with st.expander("Debug info (show values)"):
+            # Debug panel
+            with st.expander("Debug info (values & shapes)"):
                 st.write({
-                    "latest_anomaly": latest_anom,
-                    "anomaly_mean": an_mean,
-                    "anomaly_std": an_std,
-                    "an_norm": an_norm,
-                    "latest_rul": latest_rul,
-                    "rul_norm": rul_norm,
-                    "health_index": health_index,
+                    "latest_anom": latest_anom,
+                    "an_min_train_like": an_min,
+                    "an_max_train_like": an_max,
+                    "an_mean_uploaded": an_mean,
+                    "an_std_uploaded": an_std,
+                    "an_norm_latest": an_norm_latest,
+                    "latest_rul_abs": latest_rul_abs,
+                    "rul_scaled_for_index_last": float(rul_scaled_for_index[-1]) if isinstance(rul_scaled_for_index, np.ndarray) else float(rul_scaled_for_index),
+                    "health_index": hi,
                     "failure_prob": failure_prob,
                     "is_anomaly_local": is_anomaly_local,
                     "is_anomaly_fusion": is_anomaly_fusion
