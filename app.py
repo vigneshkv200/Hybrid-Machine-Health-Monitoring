@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pickle
 import tensorflow as tf
+import joblib
 import matplotlib.pyplot as plt
 
 # ---------------------------------------
@@ -17,16 +17,23 @@ st.set_page_config(
 st.title("🛠️ Hybrid Machine Health Monitoring Dashboard")
 
 # ---------------------------------------
+# MODEL PATHS
+# ---------------------------------------
+AE_PATH = "Advanced_Hybrid_ML_Project/models/autoencoder_model"
+LSTM_PATH = "Advanced_Hybrid_ML_Project/models/lstm_rul_model"
+FUSION_MODEL_PATH = "Advanced_Hybrid_ML_Project/models/fusion_model_joblib.pkl"
+FUSION_SCALER_PATH = "Advanced_Hybrid_ML_Project/models/fusion_feature_scaler_joblib.pkl"
+GLOBAL_MINMAX_PATH = "Advanced_Hybrid_ML_Project/models/global_minmax_joblib.pkl"
+
+# ---------------------------------------
 # LOAD MODELS
 # ---------------------------------------
-autoencoder = tf.keras.models.load_model("Advanced_Hybrid_ML_Project/models/autoencoder_model")
-lstm_rul = tf.keras.models.load_model("Advanced_Hybrid_ML_Project/models/lstm_rul_model")
+autoencoder = tf.keras.models.load_model(AE_PATH)
+lstm_rul = tf.keras.models.load_model(LSTM_PATH)
 
-with open("Advanced_Hybrid_ML_Project/models/fusion_model.pkl", "rb") as f:
-    fusion_model = pickle.load(f)
-
-with open("Advanced_Hybrid_ML_Project/models/scaler.pkl", "rb") as f:
-    scaler = pickle.load(f)
+fusion_model = joblib.load(FUSION_MODEL_PATH)
+fusion_scaler = joblib.load(FUSION_SCALER_PATH)
+Xmin, Xmax = joblib.load(GLOBAL_MINMAX_PATH)
 
 # Load dashboard dataset
 dashboard_df = pd.read_csv("Advanced_Hybrid_ML_Project/data/raw/dashboard_dataset.csv")
@@ -35,17 +42,30 @@ dashboard_df = pd.read_csv("Advanced_Hybrid_ML_Project/data/raw/dashboard_datase
 # FUNCTIONS
 # ---------------------------------------
 def plot_series(y, title, color="blue"):
-    fig = plt.figure(figsize=(12,4))
+    fig = plt.figure(figsize=(12, 4))
     plt.plot(y, color=color)
     plt.title(title)
     plt.grid(True)
     st.pyplot(fig)
 
-def create_windows(data, window=100):
-    X = []
-    for i in range(len(data) - window):
-        X.append(data[i:i + window])
-    return np.array(X)
+def preprocess_data(df):
+    required = ["vibration", "temperature", "pressure", "torque", "current", "rpm"]
+    X = df[required].values.astype(float)
+
+    # Scale using saved min/max
+    X_scaled = (X - Xmin) / (Xmax - Xmin + 1e-9)
+
+    # Windowing
+    window = 100
+    if len(X_scaled) < window:
+        pad = np.repeat(X_scaled[-1:], window - len(X_scaled), axis=0)
+        X_scaled = np.vstack([X_scaled, pad])
+
+    Xw = []
+    for i in range(len(X_scaled) - window + 1):
+        Xw.append(X_scaled[i:i + window])
+
+    return np.array(Xw)
 
 # ---------------------------------------
 # MAIN TABS
@@ -59,7 +79,6 @@ with tab1:
 
     st.subheader("📊 Machine Health Overview")
 
-    # Health Status Card
     current_health = dashboard_df["health_index"].iloc[-1]
 
     if current_health > 0.7:
@@ -88,7 +107,6 @@ with tab1:
 
     st.markdown("---")
 
-    # Visualization Options
     option = st.radio(
         "Select Visualization:",
         ["Health Index", "Failure Probability", "RUL Prediction", "Anomaly Score", "Raw Sensors"],
@@ -131,39 +149,38 @@ with tab2:
         required_cols = ["vibration", "temperature", "pressure", "torque", "current", "rpm"]
 
         if not set(required_cols).issubset(user_df.columns):
-            st.error("❌ CSV missing required sensor columns: vibration, temperature, pressure, torque, current, rpm")
+            st.error("❌ CSV missing required columns")
         else:
-            sensor_data = user_df[required_cols].values
-            sensor_scaled = scaler.transform(sensor_data)
-            X_input = create_windows(sensor_scaled)
+            Xw = preprocess_data(user_df)
 
-            # AE Predict
-            X_rec = autoencoder.predict(X_input)
-            anomaly_scores = np.mean((X_input - X_rec)**2, axis=(1,2))
+            # --- Hybrid Predictions ---
+            # AE anomaly score
+            X_rec = autoencoder.predict(Xw, verbose=0)
+            anomaly_scores = np.mean((Xw - X_rec)**2, axis=(1, 2))
+            anomaly_score = float(anomaly_scores[-1])
 
-            # LSTM Predict
-            rul_scaled_pred = lstm_rul.predict(X_input).flatten()
-            rul_pred = rul_scaled_pred * 9900
+            # LSTM RUL
+            rul_values = lstm_rul.predict(Xw, verbose=0).flatten()
+            rul_pred = float(rul_values[-1])
 
-            # Fusion Predict
-            fusion_features = np.column_stack([anomaly_scores, rul_pred])
-            failure_prob_user = fusion_model.predict_proba(fusion_features)[:, 1]
+            # Fusion failure probability
+            fusion_input = fusion_scaler.transform([[anomaly_score, rul_pred]])
+            failure_probability = float(fusion_model.predict_proba(fusion_input)[0][1])
 
-            # Health Index
-            anomaly_norm = (anomaly_scores - anomaly_scores.min()) / (anomaly_scores.max() - anomaly_scores.min())
-            health_index_user = 0.5 * (1 - anomaly_norm) + 0.5 * rul_scaled_pred
+            # Health index
+            health_index = max(0.0, 1 - anomaly_score * 50)
+            health_index = min(1.0, health_index)
 
             st.subheader("🔍 Prediction Results")
             col1, col2, col3 = st.columns(3)
-            col1.metric("Health Index", f"{health_index_user[-1]:.2f}")
-            col2.metric("Failure Probability", f"{failure_prob_user[-1]:.2f}")
-            col3.metric("Predicted RUL", f"{rul_pred[-1]:.0f} steps")
+            col1.metric("Health Index", f"{health_index:.2f}")
+            col2.metric("Failure Probability", f"{failure_probability:.2f}")
+            col3.metric("Predicted RUL", f"{rul_pred:.0f} steps")
 
             st.markdown("---")
 
             # Plots
-            plot_series(health_index_user, "Health Index (Uploaded Data)", color="green")
-            plot_series(failure_prob_user, "Failure Probability (Uploaded Data)", color="red")
+            plot_series([health_index], "Health Index (Uploaded Data)", color="green")
+            plot_series([failure_probability], "Failure Probability (Uploaded Data)", color="red")
             plot_series(anomaly_scores, "Anomaly Score (Uploaded Data)", color="orange")
-            plot_series(rul_pred, "RUL Prediction (Uploaded Data)", color="purple")
-
+            plot_series(rul_values, "RUL Prediction (Uploaded Data)", color="purple")
