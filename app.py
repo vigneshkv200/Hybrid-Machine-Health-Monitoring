@@ -25,9 +25,26 @@ autoencoder = tf.keras.models.load_model(AUTOENCODER_PATH)
 lstm_rul = tf.keras.models.load_model(LSTM_MODEL_PATH)
 fusion_model = joblib.load(FUSION_MODEL_PATH)
 fusion_scaler = joblib.load(FUSION_SCALER_PATH)
+
+
 global_minmax = joblib.load(GLOBAL_MINMAX_PATH)
 
-global_min, global_max = global_minmax["min"], global_minmax["max"]
+# Support both possible saved formats:
+# - older code saved (Xmin, Xmax) as a tuple
+# - newer code may save {"min": Xmin, "max": Xmax} as a dict
+if isinstance(global_minmax, tuple) or isinstance(global_minmax, list):
+    global_min, global_max = global_minmax[0], global_minmax[1]
+elif isinstance(global_minmax, dict):
+    # accept both "min"/"max" and "Xmin"/"Xmax" keys just in case
+    if "min" in global_minmax and "max" in global_minmax:
+        global_min, global_max = global_minmax["min"], global_minmax["max"]
+    elif "Xmin" in global_minmax and "Xmax" in global_minmax:
+        global_min, global_max = global_minmax["Xmin"], global_minmax["Xmax"]
+    else:
+        raise ValueError("global_minmax dict missing expected keys ('min'/'max' or 'Xmin'/'Xmax')")
+else:
+    # unexpected format
+    raise ValueError("global_minmax has unexpected type: %s" % type(global_minmax))
 
 st.sidebar.success("Models Loaded Successfully ✔")
 
@@ -171,3 +188,4 @@ with tab2:
             plot_series(failure_prob, "Failure Probability (Uploaded Data)", color="red")
             plot_series(anomaly_scores, "Anomaly Score (Uploaded Data)", color="orange")
             plot_series(rul_pred, "RUL Prediction (Uploaded Data)", color="purple")
+
